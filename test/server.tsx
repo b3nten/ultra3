@@ -2,23 +2,17 @@ import { Ultra } from "../ultra.ts";
 import { UltraPluginReact } from "../UltraPluginReact.tsx";
 
 const app = new Ultra();
-const react = new UltraPluginReact();
-console.log(app.importMap, app.clientImportMap)
+await app.Build();
+
+const react = new UltraPluginReact(import.meta.resolve("./app.tsx"));
 
 app.Plugin(react);
 
 app.ServeStatic();
-app.ServeCompiler();
-
-const AppEntry = (await import("./app.tsx")).default
+app.ServeCompiler()
 
 app.Get("*", async () => {
-  const html = react.RenderStatic(<AppEntry/>);
-  return new Response(html, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-    },
-  });
+  return react.renderStatic();
 });
 
 app.Serve();

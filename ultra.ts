@@ -1,7 +1,7 @@
 import { deno_graph, getMimeType, Hono, type Next, toFileUrl } from "./deps.ts";
 import { esbuild, esbuildPlugins } from "./deps.ts";
-import { Logger } from "./log.ts";
 import { load } from "./graph.ts";
+import { Logger } from "./log.ts";
 import { serve } from "./deps.ts";
 
 interface SpecifierMap {
@@ -15,31 +15,13 @@ interface ImportMap {
   scopes?: Scopes;
 }
 
-type UltraOptions = {
-  mode?: "development" | "production";
-  importMap?: string;
-  clientEntry: string;
-};
-
-const DefaultUltraOptions: Required<UltraOptions> = {
-  mode: "development",
-  importMap: "./importMap.json",
-  clientEntry: "./app.tsx",
-};
-
 export class Ultra {
   private ULTRA_MODE = "development";
-  private ULTRA_BUILD_DIR = "./ultra";
+  private ULTRA_BUILD_DIR = Deno.cwd() + "/ultra";
   private ULTRA_VENDOR_DIR = this.ULTRA_BUILD_DIR + "/vendor";
 
-  clientModuleGraph: deno_graph.ModuleGraphJson | undefined;
-  clientModules: Array<string> | undefined;
-
   importMap: ImportMap | undefined;
-  clientImportMap: ImportMap | undefined;
-  clientEntry: string | undefined;
-
-  public esbuild = esbuild;
+  vendorImportMap: ImportMap | undefined;
 
   private plugins: UltraPlugin[] = [];
 
@@ -47,18 +29,44 @@ export class Ultra {
 
   static readonly Log = new Logger("DEBUG");
 
-  constructor(options: UltraOptions = DefaultUltraOptions) {
+  public Esbuild = esbuild;
+
+  private compilers: {
+    extensions: string | string[];
+    compiler: (
+      { code, fileName }: {
+        code: string;
+        fileName: string;
+      },
+    ) => Promise<Response>;
+  }[] = [];
+
+  private Utils = {
+    DirectoryExists: (path: string) => {
+      try {
+        Deno.readDirSync(path);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+
+  static Response = {
+    NotFound: new Response("Not Found", { status: 404 }),
+    Invalid: new Response("Invalid Request", { status: 400 }),
+  };
+
+  constructor() {
     try {
       this.importMap = JSON.parse(Deno.readTextFileSync(
-        options.importMap ?? DefaultUltraOptions.importMap,
+        "./importMap.json",
       ));
     } catch {
-      Ultra.Log.warning("No import map found.");
+      Ultra.Log.warning("No import map found. Ensure ./importMap.json exists.");
     }
 
-    this.ULTRA_MODE = options?.mode ?? DefaultUltraOptions.mode;
-
-    this.clientEntry = options?.clientEntry ?? DefaultUltraOptions.clientEntry;
+    this.ULTRA_MODE = "development";
 
     try {
       Deno.mkdirSync(this.ULTRA_BUILD_DIR);
@@ -72,22 +80,11 @@ export class Ultra {
     }
   }
 
-  private utils = {
-    directoryExists: (path: string) => {
-      try {
-        Deno.readDirSync(path);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    notFound: new Response("Not Found", { status: 404 }),
-  };
-
   private async vendorImportMapDependencies() {
     if (!this.importMap) return;
-    this.clientImportMap = {
+    this.vendorImportMap = {
       imports: {},
+      scopes: {},
     };
     for (
       const [module, url] of Object.entries(
@@ -97,7 +94,7 @@ export class Ultra {
       const urlObject = new URL(url);
       const folderURL =
         `${this.ULTRA_VENDOR_DIR}/${urlObject.hostname}${urlObject.pathname}`;
-      if (!this.utils.directoryExists(folderURL)) {
+      if (!this.Utils.DirectoryExists(folderURL)) {
         await Deno.mkdir(folderURL, { recursive: true });
         await esbuild.build({
           plugins: [...esbuildPlugins({
@@ -119,55 +116,63 @@ export class Ultra {
       } else {
         Ultra.Log.debug(`Vendor folder already exists for ${module}.`);
       }
-      this.clientImportMap.imports![module] = import.meta.resolve(
+      this.vendorImportMap.imports![module] = import.meta.resolve(
         folderURL + "/index.js",
-      );
+      ).replace("c:\\dev\\ultra3\\test", "")
     }
     await Deno.writeTextFile(
       `${this.ULTRA_BUILD_DIR}/importMap.json`,
-      JSON.stringify(this.clientImportMap),
+      JSON.stringify(this.vendorImportMap),
     );
-    // need to delete folders that are no longer in the import map
-  }
-
-  private async generateModuleGraph() {
-    if (!this.clientEntry) return;
-    this.clientModuleGraph = await deno_graph.createGraph(
-      import.meta.resolve(this.clientEntry),
-      {
-        kind: "codeOnly",
-        load,
-        resolve: (specifier: string, referrer: string): string => {
-          if (this.clientImportMap?.imports?.[specifier]) {
-            return this.clientImportMap.imports[specifier]!;
-          }
-          return new URL(specifier, referrer).href;
-        },
-      },
-    );
-    this.clientModules = [];
-    for (const module of this.clientModuleGraph.modules) {
-      this.clientModules.push(module.specifier);
-    }
-    await Deno.writeTextFile(
-      `${this.ULTRA_BUILD_DIR}/moduleGraph.json`,
-      JSON.stringify(this.clientModuleGraph),
-    );
-    Ultra.Log.info(`Generated module graph for ${this.clientEntry}.`);
+    this.ServeVendor()
   }
 
   private async build() {
     const t = performance.now();
     await this.vendorImportMapDependencies();
-    await this.generateModuleGraph();
     Ultra.Log.success(
       "Successfully built Ultra in " + Math.trunc(performance.now() - t) +
         "ms.",
     );
   }
 
-  public Plugin(plugin: UltraPlugin) {
-    plugin.init({importMap: this.importMap});
+  private useHonoHandler = (
+    type: "get" | "post" | "put" | "patch" | "delete" | "all",
+    path: string,
+    callback: (request: Request, next: Next) => Promise<Response>,
+  ) => {
+    // @ts-expect-error
+    return this.hono[type](path, async (ctx, next) => {
+      const request = ctx.req.raw;
+      return callback(request, next);
+    });
+  };
+
+  public async Build() {
+    await this.build();
+  }
+
+  public async Plugin(plugin: UltraPlugin) {
+    await plugin.init?.({
+      importMap: this.importMap,
+      vendorImportMap: this.vendorImportMap,
+      createModuleGraph: this.CreateModuleGraph,
+      compiler: {
+        esbuild: this.Esbuild,
+        createCompiler: this.CreateCompiler,
+      },
+      ULTRA_BUILD_DIR: this.ULTRA_BUILD_DIR,
+      ULTRA_VENDOR_DIR: this.ULTRA_VENDOR_DIR,
+      ULTRA_MODE: this.ULTRA_MODE,
+      router: {
+        get: this.Get,
+        post: this.Post,
+        put: this.Put,
+        patch: this.Patch,
+        delete: this.Delete,
+        all: this.All,
+      },
+    });
     this.plugins.push(plugin);
   }
 
@@ -200,6 +205,44 @@ export class Ultra {
         if (mimeType) {
           headers.append("Content-Type", mimeType);
         }
+        Ultra.Log.info(`Serving static file at ${path}.`);
+        return new Response(
+          res.body,
+          { status: 200, headers },
+        );
+      } catch {
+        await next();
+        return;
+      }
+    });
+    Ultra.Log.info(`Serving static files at ${params.path}.`);
+  }
+
+  public ServeVendor(){
+    this.hono.use(async (ctx, next) => {
+      if (ctx.finalized) {
+        await next();
+        return;
+      }
+      const requestUrl = new URL(ctx.req.raw.url);
+      const path = `${Deno.cwd()}${requestUrl.pathname}`;
+      if(!requestUrl.pathname.startsWith("/ultra/vendor/")){
+        await next();
+        return;
+      }
+      try {
+        console.log("ServeVendor", toFileUrl(path))
+        const res = await fetch(toFileUrl(path));
+        if (!res.ok) {
+          await next();
+          return;
+        }
+        const headers = new Headers(res.headers);
+        const mimeType = getMimeType(path) || headers.get("content-type");
+        if (mimeType) {
+          headers.append("Content-Type", mimeType);
+        }
+        Ultra.Log.info(`Serving vendored dependency at ${path}.`);
         return new Response(
           res.body,
           { status: 200, headers },
@@ -213,53 +256,88 @@ export class Ultra {
 
   public ServeCompiler() {
     // TODO: Check module graph to ensure that the file is imported by the client.
-    this.hono.use(async (ctx, next) => {
+    this.hono.get("/__compiler/*", async (ctx, next) => {
       if (ctx.finalized) {
         await next();
         return;
       }
       const requestUrl = new URL(ctx.req.raw.url);
+      Ultra.Log.debug(`Serving compiler for request ${ requestUrl.pathname}`);
       const path = requestUrl.pathname.replace("/__compiler/", "/");
       const staticPath = `${Deno.cwd()}${path}`;
       try {
         let res = await fetch(toFileUrl(staticPath));
-        console.log(res.ok)
         if (!res.ok) {
           await next();
           return;
         }
         const code = await res.text();
-        const transpiled = await this.esbuild.transform(code, {
-          loader: "tsx",
+        const compiler = this.compilers.find((compiler) =>
+          compiler.extensions.includes(path.split(".").pop()!)
+        )?.compiler;
+        if (compiler) {
+          const compiled = await compiler({ code, fileName: path });
+          Ultra.Log.info(`Compiled ${path}.`);
+          return compiled;
+        }
+        const transpiled = await this.Esbuild.transform(code, {
+          loader: "ts",
           format: "esm",
-          jsx: "automatic",
-          jsxImportSource: "react",
         });
         const headers = new Headers(res.headers);
         headers.append("Content-Type", "application/javascript");
+        Ultra.Log.info(`Compiled ${path}.`);
         return new Response(
           transpiled.code,
           { status: 200, headers },
         );
-      } catch(e) {
-        Ultra.Log.error("Failed to serve compiler: " + e.message);
+      } catch (e) {
         await next();
         return;
       }
     });
   }
 
-  private useHonoHandler = (
-    type: "get" | "post" | "put" | "patch" | "delete" | "all",
-    path: string,
-    callback: (request: Request, next: Next) => Promise<Response>,
+  public CreateCompiler = (
+    extensions: string | string[],
+    compiler: (
+      { code, fileName }: { code: string; fileName: string },
+    ) => Promise<Response>,
   ) => {
-    // @ts-expect-error
-    return this.hono[type](path, async (ctx, next) => {
-      const request = ctx.req.raw;
-      return callback(request, next);
+    this.compilers.push({
+      extensions,
+      compiler,
     });
-  };
+    Ultra.Log.info(`Created compiler for ${extensions}.`);
+  }
+
+  public async CreateModuleGraph(entry: string, options?: {
+    dynamic?: boolean;
+    verbose?: boolean;
+  }) {
+    const graph = await deno_graph.createGraph(
+      import.meta.resolve(entry),
+      {
+        kind: "codeOnly",
+        load: !options?.dynamic ? load : undefined,
+        resolve: (specifier: string, referrer: string): string => {
+          if (this.importMap) {
+            if (this.importMap.imports?.[specifier]) {
+              return this.importMap.imports[specifier]!;
+            }
+          }
+          return new URL(specifier, referrer).href;
+        },
+      },
+    );
+    Ultra.Log.info(`Generated module graph for ${entry}.`);
+    if (options?.verbose) {
+      return graph;
+    } else {
+      const modules = graph.modules.map((module) => module.specifier);
+      return modules;
+    }
+  }
 
   public Get = (
     path: string,
@@ -287,15 +365,39 @@ export class Ultra {
   ) => this.useHonoHandler("all", path, callback);
 
   public async Serve(port: number = 8000) {
-    await this.build();
     await serve(this.hono.fetch, { port });
   }
 }
 
+type UltraPluginInput = {
+  importMap: ImportMap | undefined;
+  vendorImportMap: ImportMap | undefined;
+  createModuleGraph: Ultra["CreateModuleGraph"];
+  compiler: {
+    esbuild: typeof esbuild;
+    createCompiler: (
+      extensions: string | string[],
+      compiler: (
+        { code, fileName }: { code: string; fileName: string },
+      ) => Promise<Response>,
+    ) => void;
+  };
+  ULTRA_BUILD_DIR: string;
+  ULTRA_VENDOR_DIR: string;
+  ULTRA_MODE: string;
+  router: {
+    get: Ultra["Get"];
+    post: Ultra["Post"];
+    put: Ultra["Put"];
+    patch: Ultra["Patch"];
+    delete: Ultra["Delete"];
+    all: Ultra["All"];
+  };
+};
+
 export abstract class UltraPlugin {
   abstract name: string;
-  init({importMap}: any): void {}
-  onBuild(): void {}
-  onServeStatic(): void {}
-  onCompile(): void {}
+  abstract init?(input: UltraPluginInput): Promise<void> | void;
+  abstract build?(input: UltraPluginInput): Promise<void> | void;
+  abstract serve?(input: UltraPluginInput): Promise<void> | void;
 }
