@@ -1,7 +1,8 @@
-import { type Next, deno_graph, Hono } from "./deps.ts";
+import { deno_graph, getMimeType, Hono, type Next, toFileUrl } from "./deps.ts";
 import { esbuild, esbuildPlugins } from "./deps.ts";
 import { Logger } from "./log.ts";
 import { load } from "./graph.ts";
+import { serve } from "./deps.ts";
 
 interface SpecifierMap {
   [url: string]: string | null;
@@ -23,7 +24,7 @@ type UltraOptions = {
 const DefaultUltraOptions: Required<UltraOptions> = {
   mode: "development",
   importMap: "./importMap.json",
-  clientEntry: "./app.ts",
+  clientEntry: "./app.tsx",
 };
 
 export class Ultra {
@@ -37,6 +38,8 @@ export class Ultra {
   importMap: ImportMap | undefined;
   clientImportMap: ImportMap | undefined;
   clientEntry: string | undefined;
+
+  public esbuild = esbuild;
 
   private plugins: UltraPlugin[] = [];
 
@@ -78,6 +81,7 @@ export class Ultra {
         return false;
       }
     },
+    notFound: new Response("Not Found", { status: 404 }),
   };
 
   private async vendorImportMapDependencies() {
@@ -163,15 +167,87 @@ export class Ultra {
   }
 
   public Plugin(plugin: UltraPlugin) {
-    plugin.setup();
+    plugin.init({importMap: this.importMap});
     this.plugins.push(plugin);
   }
 
   public ServeStatic() {
+    const params = {
+      path: "/static",
+    };
     // implement static file serving
+    // serve from static folder and ultra folder
+    this.hono.use(async (ctx, next) => {
+      if (ctx.finalized) {
+        await next();
+        return;
+      }
+      const requestUrl = new URL(ctx.req.raw.url);
+      const path = params.path + "/" + requestUrl.pathname;
+      const staticPath = `${Deno.cwd()}${path}`;
+      const ultraPath = `${this.ULTRA_BUILD_DIR}${path}`;
+      try {
+        let res = await fetch(toFileUrl(staticPath));
+        if (!res.ok) {
+          res = await fetch(toFileUrl(ultraPath));
+        }
+        if (!res.ok) {
+          await next();
+          return;
+        }
+        const headers = new Headers(res.headers);
+        const mimeType = getMimeType(path) || headers.get("content-type");
+        if (mimeType) {
+          headers.append("Content-Type", mimeType);
+        }
+        return new Response(
+          res.body,
+          { status: 200, headers },
+        );
+      } catch {
+        await next();
+        return;
+      }
+    });
   }
 
-  public ServeCompiler() {}
+  public ServeCompiler() {
+    // TODO: Check module graph to ensure that the file is imported by the client.
+    this.hono.use(async (ctx, next) => {
+      if (ctx.finalized) {
+        await next();
+        return;
+      }
+      const requestUrl = new URL(ctx.req.raw.url);
+      const path = requestUrl.pathname.replace("/__compiler/", "/");
+      const staticPath = `${Deno.cwd()}${path}`;
+      try {
+        let res = await fetch(toFileUrl(staticPath));
+        console.log(res.ok)
+        if (!res.ok) {
+          await next();
+          return;
+        }
+        const code = await res.text();
+        const transpiled = await this.esbuild.transform(code, {
+          loader: "tsx",
+          format: "esm",
+          jsx: "automatic",
+          jsxImportSource: "react",
+        });
+        const headers = new Headers(res.headers);
+        headers.append("Content-Type", "application/javascript");
+        return new Response(
+          transpiled.code,
+          { status: 200, headers },
+        );
+      } catch(e) {
+        Ultra.Log.error("Failed to serve compiler: " + e.message);
+        await next();
+        return;
+      }
+    });
+  }
 
   private useHonoHandler = (
     type: "get" | "post" | "put" | "patch" | "delete" | "all",
@@ -210,14 +286,15 @@ export class Ultra {
     callback: (request: Request, next: Next) => Promise<Response>,
   ) => this.useHonoHandler("all", path, callback);
 
-  public async Serve() {
+  public async Serve(port: number = 8000) {
     await this.build();
+    await serve(this.hono.fetch, { port });
   }
 }
 
 export abstract class UltraPlugin {
   abstract name: string;
-  setup(): void {}
+  init({importMap}: any): void {}
   onBuild(): void {}
   onServeStatic(): void {}
   onCompile(): void {}

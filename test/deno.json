@@ -1,4 +1,11 @@
 {
 	"importMap": "./importMap.json",
-	"lock": false
+  "lock": false,
+  "compilerOptions": {
+    "jsx": "react-jsxdev",
+    "jsxImportSource": "react"
+  },
+	"tasks": {
+		"dev": "deno run -A --watch ./server.tsx"
+	}
 }
